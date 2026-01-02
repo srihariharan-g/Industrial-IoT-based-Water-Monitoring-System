@@ -1,0 +1,274 @@
+#include <ESP8266WiFi.h>
+#include <FirebaseArduino.h>
+#include <ArduinoJson.h>
+#include <ESP8266WebServer.h>
+#include <time.h>
+
+// WiFi credentials
+const char* ssid = "YOUR_WIFI_SSID";
+const char* password = "YOUR_WIFI_PASSWORD";
+
+// Firebase configuration
+#define FIREBASE_HOST "your-project.firebaseio.com"
+#define FIREBASE_AUTH "your-firebase-auth-token"
+
+// Web server for local API
+ESP8266WebServer server(80);
+
+// Sensor pins for ESP8266 (node controller)
+#define FLOW_SENSOR_PIN D2
+#define WATER_LEVEL_SENSOR_PIN A0
+
+// Node configuration - Change this for each node
+#define NODE_ID "ESP8266_NODE_01"
+#define NODE_LOCATION "Building_A_Floor_1"
+
+// Variables for flow sensor
+volatile int flowPulseCount = 0;
+float flowRate = 0.0;
+float totalVolume = 0.0;
+unsigned long oldTime = 0;
+
+// Water level variables
+float waterLevel = 0.0;
+
+// Timing variables
+unsigned long lastSensorRead = 0;
+unsigned long lastDataSend = 0;
+const unsigned long SENSOR_INTERVAL = 2000; // Read sensors every 2 seconds
+const unsigned long DATA_SEND_INTERVAL = 60000; // Send data every minute
+
+// Status variables
+bool wifiConnected = false;
+bool firebaseConnected = false;
+
+// Flow sensor interrupt
+ICACHE_RAM_ATTR void flowSensorISR() {
+  flowPulseCount++;
+}
+
+void setup() {
+  Serial.begin(115200);
+  Serial.println();
+  Serial.println("ESP8266 Water Monitoring Node Starting...");
+  
+  // Initialize pins
+  pinMode(FLOW_SENSOR_PIN, INPUT_PULLUP);
+  pinMode(WATER_LEVEL_SENSOR_PIN, INPUT);
+  
+  // Attach interrupt for flow sensor
+  attachInterrupt(digitalPinToInterrupt(FLOW_SENSOR_PIN), flowSensorISR, FALLING);
+  
+  // Connect to WiFi
+  connectToWiFi();
+  
+  // Initialize Firebase
+  Firebase.begin(FIREBASE_HOST, FIREBASE_AUTH);
+  
+  // Initialize time
+  configTime(19800, 0, "pool.ntp.org"); // UTC+5:30 for India
+  
+  // Setup web server
+  setupWebServer();
+  
+  Serial.println("Node initialized successfully!");
+  Serial.printf("Node ID: %s\n", NODE_ID);
+  Serial.printf("Location: %s\n", NODE_LOCATION);
+}
+
+void loop() {
+  unsigned long currentTime = millis();
+  
+  // Handle web server
+  server.handleClient();
+  
+  // Check WiFi connection
+  if (WiFi.status() != WL_CONNECTED) {
+    wifiConnected = false;
+    Serial.println("WiFi disconnected, attempting reconnection...");
+    connectToWiFi();
+  } else {
+    wifiConnected = true;
+  }
+  
+  // Read sensors
+  if (currentTime - lastSensorRead >= SENSOR_INTERVAL) {
+    readSensors();
+    lastSensorRead = currentTime;
+  }
+  
+  // Send data to Firebase
+  if (currentTime - lastDataSend >= DATA_SEND_INTERVAL && wifiConnected) {
+    sendDataToFirebase();
+    lastDataSend = currentTime;
+  }
+  
+  delay(100);
+}
+
+void connectToWiFi() {
+  WiFi.begin(ssid, password);
+  Serial.print("Connecting to WiFi");
+  
+  int attempts = 0;
+  while (WiFi.status() != WL_CONNECTED && attempts < 20) {
+    delay(500);
+    Serial.print(".");
+    attempts++;
+  }
+  
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println();
+    Serial.println("WiFi connected successfully!");
+    Serial.print("IP Address: ");
+    Serial.println(WiFi.localIP());
+    wifiConnected = true;
+  } else {
+    Serial.println();
+    Serial.println("Failed to connect to WiFi");
+    wifiConnected = false;
+  }
+}
+
+void readSensors() {
+  // Read flow sensor (YF-S201)
+  if ((millis() - oldTime) > 1000) {
+    detachInterrupt(digitalPinToInterrupt(FLOW_SENSOR_PIN));
+    
+    // Calculate flow rate (YF-S201: 7.5 pulses per second = 1 L/min)
+    flowRate = ((1000.0 / (millis() - oldTime)) * flowPulseCount) / 7.5;
+    oldTime = millis();
+    
+    // Add to total volume
+    totalVolume += (flowRate / 60); // Convert to liters per second, then add
+    
+    flowPulseCount = 0;
+    attachInterrupt(digitalPinToInterrupt(FLOW_SENSOR_PIN), flowSensorISR, FALLING);
+  }
+  
+  // Read water level sensor (REL_35)
+  int levelRaw = analogRead(WATER_LEVEL_SENSOR_PIN);
+  waterLevel = (levelRaw / 1024.0) * 100.0; // Convert to percentage
+  
+  // Debug output
+  Serial.printf("[%s] Flow: %.2f L/min, Total: %.2f L, Level: %.2f%%\n", 
+                NODE_ID, flowRate, totalVolume, waterLevel);
+}
+
+void sendDataToFirebase() {
+  if (!wifiConnected) {
+    Serial.println("No WiFi connection, skipping Firebase update");
+    return;
+  }
+  
+  // Create data object
+  StaticJsonDocument<512> doc;
+  doc["nodeId"] = NODE_ID;
+  doc["location"] = NODE_LOCATION;
+  doc["timestamp"] = millis(); // You might want to use NTP time here
+  doc["flowRate"] = flowRate;
+  doc["totalVolume"] = totalVolume;
+  doc["waterLevel"] = waterLevel;
+  doc["wifiSignal"] = WiFi.RSSI();
+  doc["freeHeap"] = ESP.getFreeHeap();
+  
+  String jsonString;
+  serializeJson(doc, jsonString);
+  
+  // Create Firebase path
+  String path = "/nodes/" + String(NODE_ID) + "/current";
+  
+  // Send to Firebase
+  if (Firebase.setString(path, jsonString)) {
+    Serial.println("Data sent to Firebase successfully");
+    firebaseConnected = true;
+    
+    // Also log historical data
+    String historyPath = "/nodes/" + String(NODE_ID) + "/history/" + String(millis());
+    Firebase.setString(historyPath, jsonString);
+    
+  } else {
+    Serial.println("Failed to send data to Firebase");
+    Serial.println(Firebase.error());
+    firebaseConnected = false;
+  }
+}
+
+void setupWebServer() {
+  // Current sensor data endpoint
+  server.on("/api/data", HTTP_GET, [](){
+    StaticJsonDocument<512> doc;
+    doc["nodeId"] = NODE_ID;
+    doc["location"] = NODE_LOCATION;
+    doc["flowRate"] = flowRate;
+    doc["totalVolume"] = totalVolume;
+    doc["waterLevel"] = waterLevel;
+    doc["timestamp"] = millis();
+    doc["wifiConnected"] = wifiConnected;
+    doc["firebaseConnected"] = firebaseConnected;
+    
+    String response;
+    serializeJson(doc, response);
+    
+    server.send(200, "application/json", response);
+  });
+  
+  // Node status endpoint
+  server.on("/api/status", HTTP_GET, [](){
+    StaticJsonDocument<256> doc;
+    doc["nodeId"] = NODE_ID;
+    doc["location"] = NODE_LOCATION;
+    doc["uptime"] = millis();
+    doc["wifiSignal"] = WiFi.RSSI();
+    doc["freeHeap"] = ESP.getFreeHeap();
+    doc["wifiConnected"] = wifiConnected;
+    doc["firebaseConnected"] = firebaseConnected;
+    
+    String response;
+    serializeJson(doc, response);
+    
+    server.send(200, "application/json", response);
+  });
+  
+  // Reset volume endpoint
+  server.on("/api/reset", HTTP_POST, [](){
+    totalVolume = 0;
+    server.send(200, "text/plain", "Volume reset successfully");
+    Serial.println("Volume reset via API");
+  });
+  
+  // Node configuration endpoint
+  server.on("/api/config", HTTP_GET, [](){
+    StaticJsonDocument<256> doc;
+    doc["nodeId"] = NODE_ID;
+    doc["location"] = NODE_LOCATION;
+    doc["sensorInterval"] = SENSOR_INTERVAL;
+    doc["dataSendInterval"] = DATA_SEND_INTERVAL;
+    doc["version"] = "1.0.0";
+    
+    String response;
+    serializeJson(doc, response);
+    
+    server.send(200, "application/json", response);
+  });
+  
+  // Root endpoint
+  server.on("/", HTTP_GET, [](){
+    String html = "<html><body>";
+    html += "<h1>Water Monitoring Node</h1>";
+    html += "<p><strong>Node ID:</strong> " + String(NODE_ID) + "</p>";
+    html += "<p><strong>Location:</strong> " + String(NODE_LOCATION) + "</p>";
+    html += "<p><strong>Flow Rate:</strong> " + String(flowRate) + " L/min</p>";
+    html += "<p><strong>Total Volume:</strong> " + String(totalVolume) + " L</p>";
+    html += "<p><strong>Water Level:</strong> " + String(waterLevel) + "%</p>";
+    html += "<p><strong>WiFi:</strong> " + String(wifiConnected ? "Connected" : "Disconnected") + "</p>";
+    html += "<p><strong>Firebase:</strong> " + String(firebaseConnected ? "Connected" : "Disconnected") + "</p>";
+    html += "<br><a href='/api/data'>API Data</a> | <a href='/api/status'>Node Status</a>";
+    html += "</body></html>";
+    
+    server.send(200, "text/html", html);
+  });
+  
+  server.begin();
+  Serial.println("Web server started on port 80");
+}

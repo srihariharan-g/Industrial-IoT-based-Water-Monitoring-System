@@ -1,0 +1,245 @@
+#include <WiFi.h>
+#include <FirebaseESP32.h>
+#include <ArduinoJson.h>
+#include <ESPAsyncWebServer.h>
+#include <time.h>
+
+// WiFi credentials
+const char* ssid = "YOUR_WIFI_SSID";
+const char* password = "YOUR_WIFI_PASSWORD";
+
+// Firebase configuration
+#define FIREBASE_HOST "your-project.firebaseio.com"
+#define FIREBASE_AUTH "your-firebase-auth-token"
+
+FirebaseData firebaseData;
+FirebaseAuth auth;
+FirebaseConfig config;
+
+// Web server
+AsyncWebServer server(80);
+
+// Sensor pins for ESP32 (main controller)
+#define FLOW_SENSOR_PIN 2
+#define PRESSURE_SENSOR_PIN A0
+#define WATER_LEVEL_SENSOR_PIN A1
+
+// Variables for flow sensor
+volatile int flowPulseCount = 0;
+float flowRate = 0.0;
+float totalVolume = 0.0;
+unsigned long oldTime = 0;
+
+// Pressure and level variables
+float pressureValue = 0.0;
+float waterLevel = 0.0;
+
+// Leak detection
+bool leakDetected = false;
+float baselinePressure = 0.0;
+const float PRESSURE_THRESHOLD = 10.0; // Adjust based on your system
+
+// Timing variables
+unsigned long lastSensorRead = 0;
+unsigned long lastDataSend = 0;
+const unsigned long SENSOR_INTERVAL = 1000; // Read sensors every second
+const unsigned long DATA_SEND_INTERVAL = 30000; // Send data every 30 seconds
+
+// Flow sensor interrupt
+void IRAM_ATTR flowSensorISR() {
+  flowPulseCount++;
+}
+
+void setup() {
+  Serial.begin(115200);
+  
+  // Initialize pins
+  pinMode(FLOW_SENSOR_PIN, INPUT_PULLUP);
+  pinMode(PRESSURE_SENSOR_PIN, INPUT);
+  pinMode(WATER_LEVEL_SENSOR_PIN, INPUT);
+  
+  // Attach interrupt for flow sensor
+  attachInterrupt(digitalPinToInterrupt(FLOW_SENSOR_PIN), flowSensorISR, FALLING);
+  
+  // Connect to WiFi
+  WiFi.begin(ssid, password);
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(1000);
+    Serial.println("Connecting to WiFi...");
+  }
+  Serial.println("Connected to WiFi");
+  Serial.print("IP Address: ");
+  Serial.println(WiFi.localIP());
+  
+  // Initialize Firebase
+  config.host = FIREBASE_HOST;
+  config.signer.tokens.legacy_token = FIREBASE_AUTH;
+  Firebase.begin(&config, &auth);
+  Firebase.reconnectWiFi(true);
+  
+  // Initialize time
+  configTime(19800, 0, "pool.ntp.org"); // UTC+5:30 for India
+  
+  // Setup web server routes
+  setupWebServer();
+  
+  // Calibrate baseline pressure
+  calibrateBaseline();
+  
+  Serial.println("System initialized successfully!");
+}
+
+void loop() {
+  unsigned long currentTime = millis();
+  
+  // Read sensors
+  if (currentTime - lastSensorRead >= SENSOR_INTERVAL) {
+    readAllSensors();
+    detectLeaks();
+    lastSensorRead = currentTime;
+  }
+  
+  // Send data to Firebase
+  if (currentTime - lastDataSend >= DATA_SEND_INTERVAL) {
+    sendDataToFirebase();
+    lastDataSend = currentTime;
+  }
+  
+  delay(100);
+}
+
+void readAllSensors() {
+  // Read flow sensor
+  if ((millis() - oldTime) > 1000) {
+    detachInterrupt(digitalPinToInterrupt(FLOW_SENSOR_PIN));
+    flowRate = ((1000.0 / (millis() - oldTime)) * flowPulseCount) / 7.5; // L/min
+    oldTime = millis();
+    totalVolume += (flowRate / 60); // Add to total volume in liters
+    flowPulseCount = 0;
+    attachInterrupt(digitalPinToInterrupt(FLOW_SENSOR_PIN), flowSensorISR, FALLING);
+  }
+  
+  // Read pressure sensor (0-5V to 0-1023, convert to bar)
+  int pressureRaw = analogRead(PRESSURE_SENSOR_PIN);
+  pressureValue = (pressureRaw * 5.0 / 1023.0) * 10.0; // Convert to bar
+  
+  // Read water level sensor (0-5V to 0-1023, convert to percentage)
+  int levelRaw = analogRead(WATER_LEVEL_SENSOR_PIN);
+  waterLevel = (levelRaw / 1023.0) * 100.0; // Convert to percentage
+  
+  // Print readings for debugging
+  Serial.printf("Flow Rate: %.2f L/min, Total: %.2f L, Pressure: %.2f bar, Level: %.2f%%\n", 
+                flowRate, totalVolume, pressureValue, waterLevel);
+}
+
+void detectLeaks() {
+  // Simple leak detection based on pressure drop
+  if (baselinePressure > 0 && (baselinePressure - pressureValue) > PRESSURE_THRESHOLD) {
+    if (!leakDetected) {
+      leakDetected = true;
+      Serial.println("LEAK DETECTED!");
+      sendLeakAlert();
+    }
+  } else {
+    leakDetected = false;
+  }
+}
+
+void calibrateBaseline() {
+  Serial.println("Calibrating baseline pressure...");
+  float total = 0;
+  for (int i = 0; i < 10; i++) {
+    int reading = analogRead(PRESSURE_SENSOR_PIN);
+    total += (reading * 5.0 / 1023.0) * 10.0;
+    delay(500);
+  }
+  baselinePressure = total / 10.0;
+  Serial.printf("Baseline pressure set to: %.2f bar\n", baselinePressure);
+}
+
+void sendDataToFirebase() {
+  if (WiFi.status() == WL_CONNECTED) {
+    // Create JSON object
+    FirebaseJson json;
+    
+    // Get current timestamp
+    time_t now;
+    time(&now);
+    
+    json.set("timestamp", now);
+    json.set("flowRate", flowRate);
+    json.set("totalVolume", totalVolume);
+    json.set("pressure", pressureValue);
+    json.set("waterLevel", waterLevel);
+    json.set("leakDetected", leakDetected);
+    json.set("deviceId", "ESP32_MAIN");
+    
+    // Send to Firebase
+    String path = "/water_monitoring/" + String(now);
+    if (Firebase.setJSON(firebaseData, path.c_str(), json)) {
+      Serial.println("Data sent to Firebase successfully");
+    } else {
+      Serial.println("Failed to send data to Firebase");
+      Serial.println(firebaseData.errorReason());
+    }
+  }
+}
+
+void sendLeakAlert() {
+  FirebaseJson alertJson;
+  time_t now;
+  time(&now);
+  
+  alertJson.set("timestamp", now);
+  alertJson.set("alertType", "LEAK_DETECTED");
+  alertJson.set("pressure", pressureValue);
+  alertJson.set("baselinePressure", baselinePressure);
+  alertJson.set("deviceId", "ESP32_MAIN");
+  alertJson.set("severity", "HIGH");
+  
+  String alertPath = "/alerts/" + String(now);
+  Firebase.setJSON(firebaseData, alertPath.c_str(), alertJson);
+  
+  Serial.println("Leak alert sent to Firebase");
+}
+
+void setupWebServer() {
+  // Serve current sensor data
+  server.on("/api/data", HTTP_GET, [](AsyncWebServerRequest *request){
+    AsyncResponseStream *response = request->beginResponseStream("application/json");
+    DynamicJsonDocument doc(1024);
+    
+    doc["flowRate"] = flowRate;
+    doc["totalVolume"] = totalVolume;
+    doc["pressure"] = pressureValue;
+    doc["waterLevel"] = waterLevel;
+    doc["leakDetected"] = leakDetected;
+    doc["timestamp"] = millis();
+    
+    serializeJson(doc, *response);
+    request->send(response);
+  });
+  
+  // System status endpoint
+  server.on("/api/status", HTTP_GET, [](AsyncWebServerRequest *request){
+    AsyncResponseStream *response = request->beginResponseStream("application/json");
+    DynamicJsonDocument doc(512);
+    
+    doc["wifi"] = WiFi.status() == WL_CONNECTED;
+    doc["firebase"] = true; // Add proper Firebase status check
+    doc["uptime"] = millis();
+    doc["freeHeap"] = ESP.getFreeHeap();
+    
+    serializeJson(doc, *response);
+    request->send(response);
+  });
+  
+  // Reset total volume endpoint
+  server.on("/api/reset", HTTP_POST, [](AsyncWebServerRequest *request){
+    totalVolume = 0;
+    request->send(200, "text/plain", "Volume reset successfully");
+  });
+  
+  server.begin();
+  Serial.println("Web server started");
+}
